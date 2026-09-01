@@ -136,6 +136,55 @@ CFA_ENTRY_TEST_ROUNDS=2 CFA_ENTRY_SAMPLE_PORTS=2 \
 `rollback` 用于撤销最近一次成功变更，包括 `apply` 或 `reset`；因此在执行
 `reset` 后仍可通过 `rollback` 回到恢复前的锁定状态。
 
+### 半自动健康监测与切换
+
+锁定入口后，可以先手工执行一次快速健康检查：
+
+```bash
+./clash-entry-ip.sh health
+```
+
+检查会强制绕过所有代理，并行访问百度、淘宝和腾讯。至少两个站点返回
+`200`～`499` 才认为互联网可达；只有一个站点可达时记为
+`internet_uncertain`，全部失败时记为 `internet_down`。这两种情况下都不会
+评价入口 IP，也不会增加失败次数。
+
+互联网可达时，脚本会检测当前锁定 IP 的代表端口。连续失败 3 次后才执行完整
+诊断并推荐不同于当前入口的合格 IP。手工确认切换：
+
+```bash
+./clash-entry-ip.sh switch
+```
+
+`switch` 会再次确认互联网可达、重新严格诊断，并在终端显示推荐 IP。只有输入
+确认后才会复用 `apply` 的备份、重载、代理验证和失败回滚流程。
+
+安装、查看或卸载当前用户的 macOS 后台监测：
+
+```bash
+./clash-entry-ip.sh monitor install
+./clash-entry-ip.sh monitor status
+./clash-entry-ip.sh monitor uninstall
+```
+
+后台任务使用 macOS LaunchAgent，默认每 60 秒运行一次短检查，不常驻 Shell
+循环。入口连续失败达到阈值后通过系统通知给出建议，但不会自动切换 IP。
+`uninstall` 只停止监测并移除 LaunchAgent，保留历史状态、日志和当前入口锁定；
+解除锁定仍使用 `reset`。
+
+默认参数可通过环境变量调整：
+
+```bash
+CLASH_ENTRY_CONNECTIVITY_URLS="https://www.baidu.com/ https://www.taobao.com/ https://www.qq.com/" \
+CLASH_ENTRY_CONNECTIVITY_TIMEOUT=5 \
+CLASH_ENTRY_MONITOR_INTERVAL=60 \
+CLASH_ENTRY_FAIL_THRESHOLD=3 \
+  ./clash-entry-ip.sh monitor install
+```
+
+监测状态保存在 `.state/monitor-state.tsv`，标准输出和错误日志分别写入
+`.state/monitor.log` 与 `.state/monitor-error.log`。
+
 检测报告保存在 `reports/`，运行状态保存在 `.state/`。两者均已加入
 `.gitignore`。报告记录订阅 UID、原始文件指纹、域名及测试端口，默认30分钟
 内有效。切换或更新订阅后旧报告不能用于应用。

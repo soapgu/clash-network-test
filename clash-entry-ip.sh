@@ -16,6 +16,16 @@ TEST_ROUNDS="${CLASH_ENTRY_TEST_ROUNDS:-5}"
 SAMPLE_PORT_COUNT="${CLASH_ENTRY_SAMPLE_PORTS:-12}"
 CONNECT_TIMEOUT="${CLASH_ENTRY_CONNECT_TIMEOUT:-3}"
 MAX_CONCURRENCY="${CLASH_ENTRY_MAX_CONCURRENCY:-8}"
+CONNECTIVITY_URLS="${CLASH_ENTRY_CONNECTIVITY_URLS:-https://www.baidu.com/ https://www.taobao.com/ https://www.qq.com/}"
+CONNECTIVITY_TIMEOUT="${CLASH_ENTRY_CONNECTIVITY_TIMEOUT:-5}"
+MONITOR_INTERVAL="${CLASH_ENTRY_MONITOR_INTERVAL:-60}"
+FAIL_THRESHOLD="${CLASH_ENTRY_FAIL_THRESHOLD:-3}"
+MONITOR_STATE="$STATE_DIR/monitor-state.tsv"
+MONITOR_LOG="$STATE_DIR/monitor.log"
+MONITOR_ERROR_LOG="$STATE_DIR/monitor-error.log"
+MONITOR_LABEL="${CLASH_ENTRY_MONITOR_LABEL:-com.clash-entry-ip.monitor}"
+LAUNCH_AGENT_DIR="${CLASH_ENTRY_LAUNCH_AGENT_DIR:-$HOME/Library/LaunchAgents}"
+MONITOR_PLIST="$LAUNCH_AGENT_DIR/$MONITOR_LABEL.plist"
 MANAGED_BEGIN='// CLASH_ENTRY_IP_MANAGED_BEGIN'
 TAB=$(printf '\t')
 
@@ -28,8 +38,17 @@ is_ipv4(){ awk -F. 'NF!=4{exit 1}{for(i=1;i<=4;i++)if($i!~/^[0-9]+$/||$i>255)exi
 $1
 EOF
 }
+positive_int(){ case "$1" in ''|*[!0-9]*|0)return 1;;*)return 0;;esac; }
 fingerprint(){ shasum -a 256 "$1"|awk '{print $1}'; }
 scalar(){ sed -n "s/^[[:space:]]*$1:[[:space:]]*//p" "$2"|head -1|sed -E "s/^['\"]//;s/['\"]$//"; }
+state_value(){ [ -f "$MONITOR_STATE" ]&&awk -F '\t' -v k="$1" '$1==k{print $2;exit}' "$MONITOR_STATE"; }
+write_monitor_state(){
+ local tmp="$MONITOR_STATE.tmp.$$"
+ safe_dirs
+ printf 'status\t%s\nchecked_epoch\t%s\nchecked_at\t%s\ninternet_success\t%s\ninternet_total\t%s\ncurrent_ip\t%s\nconsecutive_failures\t%s\nrecommended_ip\t%s\nnotified_signature\t%s\nnotification_at\t%s\n' \
+  "$1" "$(date +%s)" "$(date '+%Y-%m-%d %H:%M:%S %z')" "$2" "$3" "$4" "$5" "$6" "$7" "$8">"$tmp"
+ chmod 600 "$tmp" 2>/dev/null||true;mv "$tmp" "$MONITOR_STATE"
+}
 
 # uid、名称、原始文件、脚本文件
 current_profile(){ ruby --disable-gems -ryaml -e '
@@ -72,6 +91,49 @@ discover(){
 select_ports(){ awk -v w="$SAMPLE_PORT_COUNT" '{a[++n]=$1;if($1==9051)f=n}END{if(n<=w){for(i=1;i<=n;i++)print a[i];exit}for(i=0;i<w;i++)s[1+int(i*(n-1)/(w-1))]=1;if(f&&!s[f]){s[f]=1;for(i=n;i>=1;i--)if(s[i]&&i!=f){delete s[i];break}}for(i=1;i<=n;i++)if(s[i])print a[i]}' "$1">"$2"; }
 probe(){ local st en ok ms;st=$(perl -MTime::HiRes=time -e 'printf "%.6f",time');if nc -G "$CONNECT_TIMEOUT" -vz "$1" "$2">/dev/null 2>&1;then ok=1;else ok=0;fi;en=$(perl -MTime::HiRes=time -e 'printf "%.6f",time');ms=$(awk -v a="$st" -v b="$en" 'BEGIN{printf "%.3f",(b-a)*1000}');printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$ok" "$ms"; }
 run_tasks(){ :>"$2";export CLASH_ENTRY_CONNECT_TIMEOUT="$CONNECT_TIMEOUT" CLASH_ENTRY_RESULTS_FILE="$2";xargs -P "$MAX_CONCURRENCY" -n 2 "$0" __probe<"$1"; }
+
+connectivity_probe(){
+ local code
+ code=$(env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
+  curl --head --noproxy '*' --proxy '' --connect-timeout "$CONNECTIVITY_TIMEOUT" --max-time "$CONNECTIVITY_TIMEOUT" --silent --output /dev/null --write-out '%{http_code}' "$1" 2>/dev/null||true)
+ case "$code" in [234][0-9][0-9])return 0;;*)return 1;;esac
+}
+connectivity_check(){
+ local work url total=0 success=0 pid
+ work=$(mktemp -d "${TMPDIR:-/tmp}/entry-connectivity.XXXXXX")||return 1
+ for url in $CONNECTIVITY_URLS;do
+  total=$((total+1));(connectivity_probe "$url"&&printf '1\n'||printf '0\n')>"$work/$total"&
+ done
+ wait
+ for pid in "$work"/*;do [ "$(cat "$pid")" = 1 ]&&success=$((success+1));done
+ rm -rf "$work";CONNECTIVITY_SUCCESS=$success;CONNECTIVITY_TOTAL=$total
+ [ "$total" -gt 0 ]&&[ "$success" -ge 2 ]&&return 0
+ [ "$success" -eq 1 ]&&return 2
+ return 1
+}
+
+current_lock(){
+ local meta uid name raw script sp ip domain
+ check_files;meta=$(current_profile)||return 1;IFS="$TAB" read -r uid name raw script<<<"$meta";sp="$APP_DIR/profiles/$script"
+ [ -f "$sp" ]||return 1;ip=$(managed pinnedIp "$sp");domain=$(managed domain "$sp")
+ [ -n "$domain" ]&&[ -n "$ip" ]&&is_ipv4 "$ip"||return 1
+ printf '%s\t%s\t%s\n' "$domain" "$ip" "$APP_DIR/profiles/$raw"
+}
+quick_entry_check(){
+ local ip=$1 domain=$2 raw=$3 work nodes ports samples p
+ work=$(mktemp -d "${TMPDIR:-/tmp}/entry-health.XXXXXX")||return 1
+ nodes="$work/nodes";extract_nodes "$raw">"$nodes";ports="$work/ports"
+ awk -F '\t' -v d="$domain" '$4!="yes"&&tolower($2)==tolower(d){print $3}' "$nodes"|sort -nu>"$ports"
+ [ -s "$ports" ]||{ rm -rf "$work";return 1;};samples="$work/samples";select_ports "$ports" "$samples"
+ while read -r p;do nc -G "$CONNECT_TIMEOUT" -vz "$ip" "$p">/dev/null 2>&1||{ rm -rf "$work";return 1;};done<"$samples"
+ rm -rf "$work"
+}
+recommended_other(){ awk -F '\t' -v current="$1" '$1~/^([0-9]+\.){3}[0-9]+$/&&$2=="yes"&&$1!=current{print $1;exit}' "$LATEST_REPORT"; }
+send_notification(){
+ local current=$1 recommended=$2
+ command -v osascript>/dev/null 2>&1||return 0
+ osascript -e 'on run argv' -e 'display notification ("当前 " & item 1 of argv & " 连续失败，建议切换到 " & item 2 of argv & "；运行 clash-entry-ip.sh switch") with title "Clash 入口 IP 异常"' -e 'end run' "$current" "$recommended">/dev/null 2>&1||true
+}
 
 header(){ cat >"$1" <<EOF
 # generated_epoch	$(date +%s)
@@ -179,6 +241,91 @@ reset_lock(){
  if [ "$fail" -ne 0 ];then restore "$backup/script.js" "$sp"||true;restore "$backup/clash-verge.yaml" "$RUNTIME_CONFIG"||true;reload "$RUNTIME_CONFIG" "$payload">/dev/null 2>&1||true;rm -rf "$work";die '恢复失败，文件已还原';fi
  printf '%s\n' "$backup">"$CURRENT_BACKUP";chmod 600 "$CURRENT_BACKUP" 2>/dev/null||true;rm -rf "$work";log "已恢复当前订阅的原始入口：$domain";log 'Mihomo已重载，本地代理验证通过。';log "备份：$backup"
 }
+health_check(){
+ local notify=${1:-no} lock domain ip raw failures status recommended signature oldsig oldtime oldstatus oldip rc success total
+ need curl;need nc;need ruby;safe_dirs
+ positive_int "$CONNECTIVITY_TIMEOUT"||die 'CLASH_ENTRY_CONNECTIVITY_TIMEOUT 必须是正整数';positive_int "$FAIL_THRESHOLD"||die 'CLASH_ENTRY_FAIL_THRESHOLD 必须是正整数'
+ lock=$(current_lock)||die '当前订阅尚未锁定入口 IP，请先执行 diagnose 和 apply'
+ IFS="$TAB" read -r domain ip raw<<<"$lock";failures=$(state_value consecutive_failures);failures=${failures:-0};oldsig=$(state_value notified_signature);oldtime=$(state_value notification_at);oldstatus=$(state_value status);oldip=$(state_value current_ip)
+ case "$failures" in ''|*[!0-9]*)failures=0;;esac
+ if [ -n "$oldip" ]&&[ "$oldip" != "$ip" ];then failures=0;oldsig='';oldtime='';oldstatus='';fi
+ if connectivity_check;then rc=0;else rc=$?;fi;success=$CONNECTIVITY_SUCCESS;total=$CONNECTIVITY_TOTAL
+ if [ "$rc" -ne 0 ];then
+  [ "$rc" -eq 2 ]&&status=internet_uncertain||status=internet_down
+  write_monitor_state "$status" "$success" "$total" "$ip" "$failures" "$(state_value recommended_ip)" "$oldsig" "$oldtime"
+  log "健康状态：${status}（国内站点可达 ${success}/${total}，未判断入口 IP）";return 0
+ fi
+ if quick_entry_check "$ip" "$domain" "$raw";then
+  write_monitor_state healthy "$success" "$total" "$ip" 0 '' '' ''
+  log "健康状态：healthy（互联网可达 ${success}/${total}，入口 ${ip} 正常）";return 0
+ fi
+ failures=$((failures+1));status=entry_suspected;recommended='';signature=''
+ if [ "$failures" -ge "$FAIL_THRESHOLD" ];then
+  status=entry_down
+  if [ "$oldstatus" = entry_down ]&&[ "$oldip" = "$ip" ]&&[ -n "$(state_value recommended_ip)" ];then recommended=$(state_value recommended_ip);else
+   diagnose >/dev/null
+   [ -f "$LATEST_REPORT" ]&&[ "$(rv '# status')" = testable ]&&recommended=$(recommended_other "$ip")
+  fi
+  if [ -n "$recommended" ];then
+   signature="$ip->$recommended"
+   if [ "$notify" = yes ]&&[ "$signature" != "$oldsig" ];then send_notification "$ip" "$recommended";oldtime=$(date '+%Y-%m-%d %H:%M:%S %z');oldsig=$signature;fi
+  fi
+ fi
+ write_monitor_state "$status" "$success" "$total" "$ip" "$failures" "$recommended" "$oldsig" "$oldtime"
+ log "健康状态：${status}（互联网可达 ${success}/${total}，入口连续失败 ${failures} 次，推荐=${recommended:-无}）"
+}
+switch_ip(){
+ local lock domain current raw recommended answer rc
+ need curl;need ruby;need dig;need nc
+ lock=$(current_lock)||die '当前订阅尚未锁定入口 IP，请先执行 diagnose 和 apply';IFS="$TAB" read -r domain current raw<<<"$lock"
+ if connectivity_check;then rc=0;else rc=$?;fi
+ [ "$rc" -eq 0 ]||{ [ "$rc" -eq 2 ]&&die '互联网状态不确定（仅一个国内站点可达），拒绝切换'||die '互联网不可达，拒绝切换'; }
+ diagnose
+ [ "$(rv '# status')" = testable ]||die '严格诊断没有生成可应用的候选报告'
+ recommended=$(recommended_other "$current");[ -n "$recommended" ]||die '没有不同于当前入口的合格备用 IP'
+ printf '建议切换：%s -> %s。确认应用？[y/N] ' "$current" "$recommended"
+ IFS= read -r answer||answer=''
+ case "$answer" in y|Y|yes|YES|是) ;;*)log '已取消，未修改配置。';return 0;;esac
+ apply_ip "$recommended"
+ write_monitor_state healthy "$CONNECTIVITY_SUCCESS" "$CONNECTIVITY_TOTAL" "$recommended" 0 '' '' ''
+}
+xml_escape(){ printf '%s' "$1"|sed 's/&/\&amp;/g;s/</\&lt;/g;s/>/\&gt;/g;s/"/\&quot;/g;s/'"'"'/\&apos;/g'; }
+monitor_install(){
+ local tmp uid label script project app state reports backups urls timeout interval threshold logf errf
+ need launchctl;safe_dirs;mkdir -p "$LAUNCH_AGENT_DIR";chmod 700 "$LAUNCH_AGENT_DIR" 2>/dev/null||true
+ positive_int "$MONITOR_INTERVAL"||die 'CLASH_ENTRY_MONITOR_INTERVAL 必须是正整数';positive_int "$CONNECTIVITY_TIMEOUT"||die 'CLASH_ENTRY_CONNECTIVITY_TIMEOUT 必须是正整数';positive_int "$FAIL_THRESHOLD"||die 'CLASH_ENTRY_FAIL_THRESHOLD 必须是正整数'
+ uid=$(id -u);label=$(xml_escape "$MONITOR_LABEL");script=$(xml_escape "$PROJECT_DIR/clash-entry-ip.sh");project=$(xml_escape "$PROJECT_DIR");app=$(xml_escape "$APP_DIR");state=$(xml_escape "$STATE_DIR");reports=$(xml_escape "$REPORT_DIR");backups=$(xml_escape "$BACKUP_ROOT");urls=$(xml_escape "$CONNECTIVITY_URLS");timeout=$(xml_escape "$CONNECTIVITY_TIMEOUT");interval=$(xml_escape "$MONITOR_INTERVAL");threshold=$(xml_escape "$FAIL_THRESHOLD");logf=$(xml_escape "$MONITOR_LOG");errf=$(xml_escape "$MONITOR_ERROR_LOG")
+ tmp="$MONITOR_PLIST.tmp.$$"
+ cat >"$tmp" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>$label</string>
+<key>ProgramArguments</key><array><string>/usr/bin/env</string><string>CLASH_APP_DIR=$app</string><string>CLASH_ENTRY_STATE_DIR=$state</string><string>CLASH_ENTRY_REPORT_DIR=$reports</string><string>CLASH_ENTRY_BACKUP_DIR=$backups</string><string>CLASH_ENTRY_CONNECTIVITY_URLS=$urls</string><string>CLASH_ENTRY_CONNECTIVITY_TIMEOUT=$timeout</string><string>CLASH_ENTRY_FAIL_THRESHOLD=$threshold</string><string>$script</string><string>monitor</string><string>__check</string></array>
+<key>WorkingDirectory</key><string>$project</string>
+<key>RunAtLoad</key><true/><key>StartInterval</key><integer>$interval</integer>
+<key>StandardOutPath</key><string>$logf</string><key>StandardErrorPath</key><string>$errf</string>
+</dict></plist>
+EOF
+ launchctl bootout "gui/$uid/$MONITOR_LABEL">/dev/null 2>&1||true
+ mv "$tmp" "$MONITOR_PLIST";chmod 600 "$MONITOR_PLIST" 2>/dev/null||true
+ if ! launchctl bootstrap "gui/$uid" "$MONITOR_PLIST";then rm -f "$MONITOR_PLIST";die '后台监测安装失败';fi
+ log "后台监测已安装：每 ${MONITOR_INTERVAL} 秒检查一次";log "LaunchAgent：$MONITOR_PLIST"
+}
+monitor_status(){
+ local loaded=no uid
+ uid=$(id -u);command -v launchctl>/dev/null 2>&1&&launchctl print "gui/$uid/$MONITOR_LABEL">/dev/null 2>&1&&loaded=yes
+ log "后台监测：$([ "$loaded" = yes ]&&printf '运行中'||printf '未运行')";log "检查间隔：${MONITOR_INTERVAL} 秒";log "LaunchAgent：$([ -f "$MONITOR_PLIST" ]&&printf '已安装'||printf '未安装')"
+ if [ -f "$MONITOR_STATE" ];then
+  log "最近检查：$(state_value checked_at)";log "健康状态：$(state_value status)";log "互联网基线：$(state_value internet_success)/$(state_value internet_total)";log "当前 IP：$(state_value current_ip)";log "连续失败：$(state_value consecutive_failures) 次";log "推荐备选：$(state_value recommended_ip)";log "最近通知：$(state_value notification_at)"
+ else log '最近检查：无';fi
+ log "日志：$MONITOR_LOG"
+}
+monitor_uninstall(){
+ local uid;uid=$(id -u);command -v launchctl>/dev/null 2>&1&&launchctl bootout "gui/$uid/$MONITOR_LABEL">/dev/null 2>&1||true
+ if [ -f "$MONITOR_PLIST" ];then rm -f "$MONITOR_PLIST";log '后台监测已停止并移除；历史状态和日志已保留。';else log '后台监测未安装。';fi
+}
+monitor_cmd(){ case "${1:-}" in install)monitor_install;;status)monitor_status;;uninstall)monitor_uninstall;;__check)health_check yes;;*)die "用法：$0 monitor <install|status|uninstall>";;esac; }
 status(){
  check_files
  local meta uid name raw script sp ip d
@@ -188,8 +335,9 @@ status(){
  if [ -n "$ip" ];then log "入口锁定：$d -> $ip";else log '入口锁定：未锁定';fi
  if controller_init;then log "Mihomo控制接口：可用（${CONTROLLER_KIND}）";else log 'Mihomo控制接口：不可用';fi
  if [ -f "$LATEST_REPORT" ];then log "最近报告：$(rv '# status')，订阅=$(rv '# profile_name')，域名=$(rv '# domain')，原因=$(rv '# skip_reason')";else log '最近报告：无';fi
+ if [ -f "$MONITOR_STATE" ];then log "后台健康：$(state_value status)，连续失败=$(state_value consecutive_failures)，推荐=$(state_value recommended_ip)";else log '后台健康：无';fi
  return 0
 }
 rollback(){ need curl;[ -f "$CURRENT_BACKUP" ]||die '没有可回滚的成功应用';local b m k d f w;b=$(cat "$CURRENT_BACKUP");m="$b/manifest.tsv";[ -f "$m" ]||die '备份清单不存在';controller_init||die 'Mihomo控制接口不可连接；未修改配置';while IFS="$TAB" read -r k d f;do case "$k" in script|runtime)restore "$b/$f" "$d"||die "恢复失败：$d";;esac;done<"$m";w=$(mktemp -d "${TMPDIR:-/tmp}/entry-rollback.XXXXXX");reload "$RUNTIME_CONFIG" "$w/payload"||die '文件已恢复，但 Mihomo重载失败';rm -rf "$w";mv "$CURRENT_BACKUP" "$b/rolled-back-at-$(date '+%Y%m%d-%H%M%S')";log "已恢复：$b"; }
-usage(){ printf '用法：\n  %s diagnose\n  %s apply <IPv4>\n  %s reset\n  %s status\n  %s rollback\n' "$0" "$0" "$0" "$0" "$0"; }
-case "${1:-}" in diagnose)diagnose;;apply)apply_ip "${2:-}";;reset)reset_lock;;status)status;;rollback)rollback;;__probe)CONNECT_TIMEOUT="${CLASH_ENTRY_CONNECT_TIMEOUT:-3}";probe "${2:-}" "${3:-}">>"${CLASH_ENTRY_RESULTS_FILE:?}";;help|-h|--help|'')usage;;*)usage>&2;exit 1;;esac
+usage(){ printf '用法：\n  %s diagnose\n  %s apply <IPv4>\n  %s health\n  %s switch\n  %s monitor <install|status|uninstall>\n  %s reset\n  %s status\n  %s rollback\n' "$0" "$0" "$0" "$0" "$0" "$0" "$0" "$0"; }
+case "${1:-}" in diagnose)diagnose;;apply)apply_ip "${2:-}";;health)health_check no;;switch)switch_ip;;monitor)monitor_cmd "${2:-}";;reset)reset_lock;;status)status;;rollback)rollback;;__probe)CONNECT_TIMEOUT="${CLASH_ENTRY_CONNECT_TIMEOUT:-3}";probe "${2:-}" "${3:-}">>"${CLASH_ENTRY_RESULTS_FILE:?}";;help|-h|--help|'')usage;;*)usage>&2;exit 1;;esac
