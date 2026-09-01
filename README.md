@@ -83,6 +83,8 @@ CFA_ENTRY_TEST_ROUNDS=2 CFA_ENTRY_SAMPLE_PORTS=2 \
 
 > **适用平台：macOS。** 脚本直接操作 Mac 上 Clash Verge Rev 的当前订阅，不适用于 Android 手机导出的 YAML。
 
+深入了解：[clash-entry-ip.sh 工作原理](CLASH_ENTRY_IP.md)。
+
 ### 自动诊断与锁定
 
 先在 Clash Verge中选择需要诊断的订阅，再执行：
