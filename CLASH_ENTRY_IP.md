@@ -59,6 +59,91 @@ flowchart LR
 控制接口重载，可以让本次变更立即生效。只改其中一个，会出现当前运行状态与后续
 订阅处理结果不一致的窗口。
 
+### `clash-verge.yaml` 不是每个订阅一份
+
+Clash Verge 会为每个远程订阅保留各自的原始 YAML，并为每个订阅记录各自关联的
+合并覆写和脚本覆写；但 Mihomo 正式运行时只有一份当前配置：
+
+```text
+~/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/clash-verge.yaml
+```
+
+同目录中可能还会出现 `clash-verge-check.yaml`。它用于 Clash Verge 的配置合法性
+检查，不代表另一个订阅正在使用的独立运行配置。切换订阅时，新订阅经过覆写和
+全局设置处理后的结果会覆盖 `clash-verge.yaml`，再交给 Mihomo 加载。
+
+下面用完全虚构的 UID 和名称展示两个订阅的关系：
+
+```yaml
+current: profile-main
+items:
+  - uid: profile-main
+    type: remote
+    name: 主订阅
+    file: profile-main.yaml
+    option:
+      merge: merge-main
+      script: script-main
+
+  - uid: profile-backup
+    type: remote
+    name: 备用订阅
+    file: profile-backup.yaml
+    option:
+      merge: merge-backup
+      script: script-backup
+```
+
+| 用途 | 主订阅 | 备用订阅 |
+| --- | --- | --- |
+| 原始订阅 | `profiles/profile-main.yaml` | `profiles/profile-backup.yaml` |
+| 合并覆写 | `profiles/merge-main.yaml` | `profiles/merge-backup.yaml` |
+| 配置级脚本覆写 | `profiles/script-main.js` | `profiles/script-backup.js` |
+| 正式运行配置 | `clash-verge.yaml` | `clash-verge.yaml` |
+
+```mermaid
+flowchart TD
+    Select{Clash Verge 当前选择}
+    Main[主订阅原始 YAML] --> MainMerge[主订阅合并覆写]
+    MainMerge --> MainScript[主订阅脚本覆写]
+    Backup[备用订阅原始 YAML] --> BackupMerge[备用订阅合并覆写]
+    BackupMerge --> BackupScript[备用订阅脚本覆写]
+    Select -->|主订阅| Main
+    Select -->|备用订阅| Backup
+    MainScript --> Global[Clash 全局设置和扩展]
+    BackupScript --> Global
+    Global --> Runtime[覆盖生成 clash-verge.yaml]
+    Runtime --> Mihomo[Mihomo]
+```
+
+这也解释了为什么 `clash-entry-ip.sh` 必须读取 `profiles.yaml.current`：脚本要找出
+当前原始订阅及其专属的配置级脚本覆写，同时修改唯一的当前运行配置。
+
+### 配置级脚本与全局扩展脚本不是同一个文件
+
+Clash Verge 新建的配置级脚本通常已经存在，只是内容是一个不做处理的透传模板：
+
+```javascript
+// Define main function (script entry)
+
+function main(config, profileName) {
+  return config;
+}
+```
+
+它收到当前订阅配置后直接原样返回。`clash-entry-ip.sh` 修改的是
+`profiles.yaml` 中当前订阅 `option.script` 指向的这份配置级脚本，而不是 Clash
+Verge 界面中的全局扩展脚本。全局脚本即使仍显示为空，也不影响配置级锁定生效。
+
+不同订阅通常关联不同的配置级脚本。如果希望主订阅和备用订阅都锁定入口，必须：
+
+1. 在 Clash Verge 中选择主订阅，执行 `diagnose` 和 `apply`；
+2. 切换到备用订阅，重新执行 `diagnose` 和 `apply`。
+
+脚本每次只处理当前订阅，不会在一次 `apply` 中批量修改其他订阅。两个订阅都处理
+后，它们各自的脚本覆写会维持锁定；切换订阅时，所选订阅的脚本会重新生成共享的
+`clash-verge.yaml`。
+
 ## 3. 文件与状态模型
 
 Clash Verge 应用目录默认为：
@@ -191,6 +276,77 @@ YAML。切换订阅后必须重新诊断。
 写入的受管脚本逻辑等价于：遍历 `config.proxies`，只把 `server` 严格等于目标
 域名的节点改成指定 IP，其他节点和字段原样返回。受管标记以及脚本中的 `domain`
 和 `pinnedIp` 也供 `status`、后续 `apply` 和 `reset` 识别。
+
+### 5.1 实际生成的脚本
+
+假设诊断得到的原始入口域名是文档专用域名 `entry.example.com`，使用者选择的合格
+地址是文档专用 IPv4 `198.51.100.20`，`write_script` 会生成以下内容：
+
+```javascript
+// CLASH_ENTRY_IP_MANAGED_BEGIN
+// 由 clash-entry-ip.sh 管理；使用 reset 取消锁定，或使用 rollback 撤销最近一次变更。
+function main(config, profileName) {
+  const domain = "entry.example.com";
+  const pinnedIp = "198.51.100.20";
+  if (Array.isArray(config.proxies)) {
+    for (const proxy of config.proxies) {
+      if (proxy && proxy.server === domain) proxy.server = pinnedIp;
+    }
+  }
+  return config;
+}
+// CLASH_ENTRY_IP_MANAGED_END
+```
+
+这段代码按以下顺序执行：
+
+1. `domain` 保存诊断时确认的唯一入口域名，`pinnedIp` 保存用户明确应用的地址；
+2. `Array.isArray(config.proxies)` 先确认 `proxies` 存在且确实是数组，避免错误遍历；
+3. `for...of` 逐个查看代理节点，不修改代理组、规则、DNS 或其他顶层配置；
+4. `proxy && proxy.server === domain` 使用严格相等，只匹配入口完全相同的节点；
+5. 匹配时只赋值 `proxy.server`，节点对象中的其他字段不变；
+6. 最后返回处理后的完整 `config`，供 Clash Verge 继续处理并生成运行配置。
+
+首尾受管标记不是 JavaScript 运行所必需的，而是工具的所有权标识。`safe_script`
+据此判断脚本是否可继续更新，`status` 据此识别锁定，`reset` 据此确认只移除本工具
+写入的逻辑。标记内部的 `domain` 和 `pinnedIp` 也是后续切换 IP 或恢复域名的数据
+来源。
+
+### 5.2 节点修改前后对照
+
+处理前的节点可能是：
+
+```yaml
+- name: 示例节点 01
+  server: entry.example.com
+  port: 9051
+  type: ssr
+  cipher: aes-256-cfb
+  password: example-redacted
+```
+
+执行配置级脚本后变为：
+
+```yaml
+- name: 示例节点 01
+  server: 198.51.100.20
+  port: 9051
+  type: ssr
+  cipher: aes-256-cfb
+  password: example-redacted
+```
+
+变化只有 `server`：节点名称、端口、协议、加密方式、密码以及其他协议参数都保留。
+同一订阅中 `server` 不是 `entry.example.com` 的节点不会被这段 JavaScript 修改。
+
+### 5.3 脚本覆写与即时运行配置的配合
+
+`write_script` 写入的是长期规则：以后 Clash Verge 刷新或重新处理该订阅时，只要
+节点仍使用同一域名，就会再次替换为固定 IP。与此同时，`transform` 直接处理当前
+`clash-verge.yaml` 的 `proxies` 区域，让已经在运行的这份配置立即得到相同结果。
+
+如果当前脚本已经由本工具管理，用户再次应用另一个合格 IP，`transform` 既能识别
+原始域名，也能识别上一次的锁定 IP，从而完成 IP 切换，而不会重复叠加脚本逻辑。
 
 当前运行配置中的同一入口会同步替换，随后通过 Mihomo 控制接口重新加载。最后，
 脚本使用 `mixed-port`（缺省时使用 `7897`）作为本地 HTTP 代理访问
