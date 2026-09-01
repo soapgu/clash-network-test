@@ -104,8 +104,9 @@ EOF
 cat > "$BIN_DIR/curl" <<'EOF'
 #!/usr/bin/env bash
 case " $* " in
-  *--write-out*) printf '204' ;;
-  */version*) printf '{"version":"test"}' ;;
+  *--write-out*) [ "${CLASH_TEST_FAIL_SMOKE:-0}" = 1 ] && exit 1; printf '204' ;;
+  */version*) [ "${CLASH_TEST_CONTROLLER_DOWN:-0}" = 1 ] && exit 1; printf '{"version":"test"}' ;;
+  *'-X PUT'*/configs*) [ "${CLASH_TEST_FAIL_RELOAD:-0}" = 1 ] && exit 1; printf '{}' ;;
   */configs*) printf '{}' ;;
   *) printf '{}' ;;
 esac
@@ -165,12 +166,54 @@ grep -q 'server: 198.51.100.20' "$APP_DIR/clash-verge.yaml"
 "$PROJECT_DIR/clash-entry-ip.sh" diagnose >/dev/null
 awk -F '\t' '$1=="198.51.100.20" && $2=="yes" {ok=1} END{exit !ok}' "$STATE_DIR/latest-report.tsv"
 
-"$PROJECT_DIR/clash-entry-ip.sh" rollback >/dev/null
+# 允许第二个候选 IP，用于验证连续切换后 reset 直接恢复原始域名。
+awk -F '\t' 'BEGIN{OFS="\t"}$1=="192.0.2.10"{$2="yes"}{print}' "$STATE_DIR/latest-report.tsv" > "$TEST_ROOT/report.switch"
+cp "$TEST_ROOT/report.switch" "$STATE_DIR/latest-report.tsv"
+"$PROJECT_DIR/clash-entry-ip.sh" apply 192.0.2.10 >/dev/null
+sed '/^proxy-groups:/i\
+- name: 新增节点\
+  server: updated.example.test\
+  port: 8443' "$APP_DIR/clash-verge.yaml" > "$TEST_ROOT/runtime.updated"
+cp "$TEST_ROOT/runtime.updated" "$APP_DIR/clash-verge.yaml"
+sed '/^proxy-groups:/i\
+- name: 新增节点\
+  server: updated.example.test\
+  port: 8443' "$APP_DIR/profiles/main.yaml" > "$TEST_ROOT/profile.updated"
+cp "$TEST_ROOT/profile.updated" "$APP_DIR/profiles/main.yaml"
+
+"$PROJECT_DIR/clash-entry-ip.sh" reset >/dev/null
 grep -q 'server: entry.example.test' "$APP_DIR/clash-verge.yaml"
+grep -q 'server: updated.example.test' "$APP_DIR/clash-verge.yaml"
 if grep -q 'CLASH_ENTRY_IP_MANAGED_BEGIN' "$APP_DIR/profiles/main.js"; then
-  printf '回滚未恢复脚本覆写\n' >&2
+  printf 'reset 未移除脚本锁定\n' >&2
   exit 1
 fi
+"$PROJECT_DIR/clash-entry-ip.sh" status > "$TEST_ROOT/status.reset.txt"
+grep -q '入口锁定：未锁定' "$TEST_ROOT/status.reset.txt"
+"$PROJECT_DIR/clash-entry-ip.sh" reset > "$TEST_ROOT/reset-again.txt"
+grep -q '无需恢复' "$TEST_ROOT/reset-again.txt"
+
+# reset 本身可由 rollback 撤销。
+"$PROJECT_DIR/clash-entry-ip.sh" rollback >/dev/null
+grep -q 'const pinnedIp = "192.0.2.10"' "$APP_DIR/profiles/main.js"
+grep -q 'server: 192.0.2.10' "$APP_DIR/clash-verge.yaml"
+grep -q 'server: updated.example.test' "$APP_DIR/clash-verge.yaml"
+
+# reset 各失败路径均不得留下半恢复状态。
+for failure in CLASH_TEST_CONTROLLER_DOWN CLASH_TEST_FAIL_RELOAD CLASH_TEST_FAIL_SMOKE; do
+  before_script=$(shasum -a 256 "$APP_DIR/profiles/main.js" | awk '{print $1}')
+  before_runtime=$(shasum -a 256 "$APP_DIR/clash-verge.yaml" | awk '{print $1}')
+  if env "$failure=1" "$PROJECT_DIR/clash-entry-ip.sh" reset >/dev/null 2>&1; then
+    printf '%s 时 reset 不应成功\n' "$failure" >&2
+    exit 1
+  fi
+  [ "$before_script" = "$(shasum -a 256 "$APP_DIR/profiles/main.js" | awk '{print $1}')" ]
+  [ "$before_runtime" = "$(shasum -a 256 "$APP_DIR/clash-verge.yaml" | awk '{print $1}')" ]
+done
+
+"$PROJECT_DIR/clash-entry-ip.sh" reset >/dev/null
+grep -q 'server: entry.example.test' "$APP_DIR/clash-verge.yaml"
+grep -q 'server: updated.example.test' "$APP_DIR/clash-verge.yaml"
 
 assert_skip() {
   expected=$1

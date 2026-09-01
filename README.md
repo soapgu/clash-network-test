@@ -119,12 +119,20 @@ CFA_ENTRY_TEST_ROUNDS=2 CFA_ENTRY_SAMPLE_PORTS=2 \
 4. 通过本地代理发起请求，确认重载后的代理可用；
 5. 任一步骤失败时恢复备份。
 
-查看状态或回滚：
+查看状态、恢复订阅原始入口或撤销最近一次变更：
 
 ```bash
 ./clash-entry-ip.sh status
+./clash-entry-ip.sh reset
 ./clash-entry-ip.sh rollback
 ```
+
+`reset` 会移除本工具写入当前订阅的入口锁定，并把当前运行配置中的锁定 IP
+恢复为订阅原始域名。它不会用旧快照覆盖整个配置，因此锁定期间的订阅更新会
+保留。当前订阅未被本工具锁定时，`reset` 会提示无需恢复并安全退出。
+
+`rollback` 用于撤销最近一次成功变更，包括 `apply` 或 `reset`；因此在执行
+`reset` 后仍可通过 `rollback` 回到恢复前的锁定状态。
 
 检测报告保存在 `reports/`，运行状态保存在 `.state/`。两者均已加入
 `.gitignore`。报告记录订阅 UID、原始文件指纹、域名及测试端口，默认30分钟

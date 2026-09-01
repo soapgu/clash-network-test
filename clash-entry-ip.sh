@@ -120,7 +120,7 @@ safe_script(){ grep -qF "$MANAGED_BEGIN" "$1"&&return 0;[ "$(sed '/^[[:space:]]*
 managed(){ sed -n "s/^[[:space:]]*const $1 = \"\([^\"]*\)\";.*/\1/p" "$2"|head -1; }
 write_script(){ local tmp="$1.tmp.$$";cat >"$tmp" <<EOF
 $MANAGED_BEGIN
-// 由 clash-entry-ip.sh 管理；使用 rollback 恢复。
+// 由 clash-entry-ip.sh 管理；使用 reset 取消锁定，或使用 rollback 撤销最近一次变更。
 function main(config, profileName) {
   const domain = "$2";
   const pinnedIp = "$3";
@@ -134,7 +134,16 @@ function main(config, profileName) {
 // CLASH_ENTRY_IP_MANAGED_END
 EOF
 chmod --reference="$1" "$tmp" 2>/dev/null||chmod 600 "$tmp";mv "$tmp" "$1"; }
+write_passthrough(){ local tmp="$1.tmp.$$";cat >"$tmp" <<'EOF'
+// Define main function (script entry)
+
+function main(config, profileName) {
+  return config;
+}
+EOF
+chmod --reference="$1" "$tmp" 2>/dev/null||chmod 600 "$tmp";mv "$tmp" "$1"; }
 transform(){ awk -v d="$3" -v ip="$4" -v old="$5" '/^proxies:[[:space:]]*$/{p=1;print;next}/^proxy-groups:[[:space:]]*$/{p=0}p&&/^[[:space:]]+server:/{v=$0;sub(/^[[:space:]]+server:[[:space:]]*/,"",v);gsub(/"/,"",v);gsub(sprintf("%c",39),"",v);if(v==d||(old!=""&&v==old)){match($0,/^[[:space:]]+/);printf "%sserver: %s\n",substr($0,RSTART,RLENGTH),ip;n++;next}}{print}END{if(!n)exit 8}' "$1">"$2"||die "运行配置中没有可替换的 $3 节点"; }
+reset_transform(){ awk -v old="$3" -v domain="$4" '/^proxies:[[:space:]]*$/{p=1;print;next}/^proxy-groups:[[:space:]]*$/{p=0}p&&/^[[:space:]]+server:/{v=$0;sub(/^[[:space:]]+server:[[:space:]]*/,"",v);gsub(/"/,"",v);gsub(sprintf("%c",39),"",v);if(v==old){match($0,/^[[:space:]]+/);printf "%sserver: %s\n",substr($0,RSTART,RLENGTH),domain;next}}{print}' "$1">"$2"; }
 
 tcp_req(){
  local data=${3:-}
@@ -149,15 +158,26 @@ request(){ if [ "$CONTROLLER_KIND" = unix ];then if [ -n "${3:-}" ];then curl -s
 reload(){ ruby --disable-gems -rjson -e 'print JSON.generate({"payload"=>File.read(ARGV[0])})' "$1">"$2";request PUT '/configs?force=true' "$2">/dev/null&&request GET /configs>/dev/null; }
 smoke(){ local port code;port=$(scalar mixed-port "$RUNTIME_CONFIG");[ -n "$port" ]||port=7897;code=$(curl --silent --output /dev/null --write-out '%{http_code}' --connect-timeout 8 --max-time 15 --proxy "http://127.0.0.1:$port" https://www.google.com/generate_204||true);case "$code" in 2*|3*)return;;*)return 1;;esac; }
 restore(){ local t="$2.restore.$$";cp "$1" "$t";chmod --reference="$2" "$t" 2>/dev/null||true;mv "$t" "$2"; }
+new_backup(){ local stamp backup suffix=0;stamp=$(date '+%Y%m%d-%H%M%S');backup="$BACKUP_ROOT/$stamp";while [ -e "$backup" ];do suffix=$((suffix+1));backup="$BACKUP_ROOT/$stamp-$suffix";done;mkdir -p "$backup";chmod 700 "$BACKUP_ROOT" "$backup" 2>/dev/null||true;printf '%s\n' "$backup"; }
 
 apply_ip(){
- local ip=${1:-} meta uid name raw script sp domain old oldd stamp backup manifest work changed payload fail=0
+ local ip=${1:-} meta uid name raw script sp domain old oldd backup manifest work changed payload fail=0
  [ -n "$ip" ]||die "用法：$0 apply <IPv4>";is_ipv4 "$ip"||die "非法 IPv4：$ip";validate "$ip";need curl;check_files;controller_init||die 'Mihomo控制接口不可连接；未修改配置'
  meta=$(current_profile);IFS="$TAB" read -r uid name raw script<<<"$meta";sp="$APP_DIR/profiles/$script";[ -f "$sp" ]||die '脚本覆写不存在';safe_script "$sp"||die '当前订阅脚本已有自定义逻辑，拒绝覆盖';domain=$(rv '# domain');old=$(managed pinnedIp "$sp");oldd=$(managed domain "$sp");[ "$old" = "$ip" ]&&[ "$oldd" = "$domain" ]&&{ log "已经锁定 $domain -> ${ip}，无需重复写入";return; }
- stamp=$(date '+%Y%m%d-%H%M%S');backup="$BACKUP_ROOT/$stamp";mkdir -p "$backup";chmod 700 "$BACKUP_ROOT" "$backup" 2>/dev/null||true;cp "$sp" "$backup/script.js";cp "$RUNTIME_CONFIG" "$backup/clash-verge.yaml";manifest="$backup/manifest.tsv";printf 'script\t%s\tscript.js\nruntime\t%s\tclash-verge.yaml\n' "$sp" "$RUNTIME_CONFIG">"$manifest"
+ backup=$(new_backup);cp "$sp" "$backup/script.js";cp "$RUNTIME_CONFIG" "$backup/clash-verge.yaml";manifest="$backup/manifest.tsv";printf 'script\t%s\tscript.js\nruntime\t%s\tclash-verge.yaml\n' "$sp" "$RUNTIME_CONFIG">"$manifest"
  work=$(mktemp -d "${TMPDIR:-/tmp}/entry-apply.XXXXXX");changed="$work/config";payload="$work/payload";transform "$RUNTIME_CONFIG" "$changed" "$domain" "$ip" "$old";write_script "$sp" "$domain" "$ip"||fail=1;[ "$fail" -ne 0 ]||restore "$changed" "$RUNTIME_CONFIG"||fail=1;[ "$fail" -ne 0 ]||reload "$RUNTIME_CONFIG" "$payload"||fail=1;[ "$fail" -ne 0 ]||smoke||fail=1
  if [ "$fail" -ne 0 ];then restore "$backup/script.js" "$sp"||true;restore "$backup/clash-verge.yaml" "$RUNTIME_CONFIG"||true;reload "$RUNTIME_CONFIG" "$payload">/dev/null 2>&1||true;rm -rf "$work";die '应用失败，文件已恢复';fi
  printf '%s\n' "$backup">"$CURRENT_BACKUP";chmod 600 "$CURRENT_BACKUP" 2>/dev/null||true;rm -rf "$work";log "已锁定当前订阅：$domain -> $ip";log 'Mihomo已重载，本地代理验证通过。';log "备份：$backup"
+}
+reset_lock(){
+ local meta uid name raw script sp domain ip backup manifest work changed payload fail=0
+ need curl;check_files;meta=$(current_profile)||die '无法定位当前订阅';IFS="$TAB" read -r uid name raw script<<<"$meta";sp="$APP_DIR/profiles/$script";[ -f "$sp" ]||die '脚本覆写不存在'
+ if ! grep -qF "$MANAGED_BEGIN" "$sp";then log '当前订阅没有由 clash-entry-ip.sh 创建的入口锁定，无需恢复。';return;fi
+ domain=$(managed domain "$sp");ip=$(managed pinnedIp "$sp");[ -n "$domain" ]&&[ -n "$ip" ]&&is_ipv4 "$ip"||die '受管脚本内容不完整，未修改配置';controller_init||die 'Mihomo控制接口不可连接；未修改配置'
+ backup=$(new_backup);cp "$sp" "$backup/script.js";cp "$RUNTIME_CONFIG" "$backup/clash-verge.yaml";manifest="$backup/manifest.tsv";printf 'script\t%s\tscript.js\nruntime\t%s\tclash-verge.yaml\n' "$sp" "$RUNTIME_CONFIG">"$manifest"
+ work=$(mktemp -d "${TMPDIR:-/tmp}/entry-reset.XXXXXX");changed="$work/config";payload="$work/payload";reset_transform "$RUNTIME_CONFIG" "$changed" "$ip" "$domain"||fail=1;[ "$fail" -ne 0 ]||write_passthrough "$sp"||fail=1;[ "$fail" -ne 0 ]||restore "$changed" "$RUNTIME_CONFIG"||fail=1;[ "$fail" -ne 0 ]||reload "$RUNTIME_CONFIG" "$payload"||fail=1;[ "$fail" -ne 0 ]||smoke||fail=1
+ if [ "$fail" -ne 0 ];then restore "$backup/script.js" "$sp"||true;restore "$backup/clash-verge.yaml" "$RUNTIME_CONFIG"||true;reload "$RUNTIME_CONFIG" "$payload">/dev/null 2>&1||true;rm -rf "$work";die '恢复失败，文件已还原';fi
+ printf '%s\n' "$backup">"$CURRENT_BACKUP";chmod 600 "$CURRENT_BACKUP" 2>/dev/null||true;rm -rf "$work";log "已恢复当前订阅的原始入口：$domain";log 'Mihomo已重载，本地代理验证通过。';log "备份：$backup"
 }
 status(){
  check_files
@@ -171,5 +191,5 @@ status(){
  return 0
 }
 rollback(){ need curl;[ -f "$CURRENT_BACKUP" ]||die '没有可回滚的成功应用';local b m k d f w;b=$(cat "$CURRENT_BACKUP");m="$b/manifest.tsv";[ -f "$m" ]||die '备份清单不存在';controller_init||die 'Mihomo控制接口不可连接；未修改配置';while IFS="$TAB" read -r k d f;do case "$k" in script|runtime)restore "$b/$f" "$d"||die "恢复失败：$d";;esac;done<"$m";w=$(mktemp -d "${TMPDIR:-/tmp}/entry-rollback.XXXXXX");reload "$RUNTIME_CONFIG" "$w/payload"||die '文件已恢复，但 Mihomo重载失败';rm -rf "$w";mv "$CURRENT_BACKUP" "$b/rolled-back-at-$(date '+%Y%m%d-%H%M%S')";log "已恢复：$b"; }
-usage(){ printf '用法：\n  %s diagnose\n  %s apply <IPv4>\n  %s status\n  %s rollback\n' "$0" "$0" "$0" "$0"; }
-case "${1:-}" in diagnose)diagnose;;apply)apply_ip "${2:-}";;status)status;;rollback)rollback;;__probe)CONNECT_TIMEOUT="${CLASH_ENTRY_CONNECT_TIMEOUT:-3}";probe "${2:-}" "${3:-}">>"${CLASH_ENTRY_RESULTS_FILE:?}";;help|-h|--help|'')usage;;*)usage>&2;exit 1;;esac
+usage(){ printf '用法：\n  %s diagnose\n  %s apply <IPv4>\n  %s reset\n  %s status\n  %s rollback\n' "$0" "$0" "$0" "$0" "$0"; }
+case "${1:-}" in diagnose)diagnose;;apply)apply_ip "${2:-}";;reset)reset_lock;;status)status;;rollback)rollback;;__probe)CONNECT_TIMEOUT="${CLASH_ENTRY_CONNECT_TIMEOUT:-3}";probe "${2:-}" "${3:-}">>"${CLASH_ENTRY_RESULTS_FILE:?}";;help|-h|--help|'')usage;;*)usage>&2;exit 1;;esac
