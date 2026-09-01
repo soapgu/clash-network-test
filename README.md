@@ -175,7 +175,7 @@ CFA_ENTRY_TEST_ROUNDS=2 CFA_ENTRY_SAMPLE_PORTS=2 \
 默认参数可通过环境变量调整：
 
 ```bash
-CLASH_ENTRY_CONNECTIVITY_URLS="https://www.baidu.com/ https://www.taobao.com/ https://www.qq.com/" \
+CLASH_ENTRY_CONNECTIVITY_URLS="https://www.baidu.com/ https://www.taobao.com/ https://www.qq.com/favicon.ico" \
 CLASH_ENTRY_CONNECTIVITY_TIMEOUT=5 \
 CLASH_ENTRY_MONITOR_INTERVAL=60 \
 CLASH_ENTRY_FAIL_THRESHOLD=3 \
