@@ -282,7 +282,8 @@ switch_ip(){
  [ "$rc" -eq 0 ]||{ [ "$rc" -eq 2 ]&&die '互联网状态不确定（仅一个国内站点可达），拒绝切换'||die '互联网不可达，拒绝切换'; }
  diagnose
  [ "$(rv '# status')" = testable ]||die '严格诊断没有生成可应用的候选报告'
- recommended=$(recommended_other "$current");[ -n "$recommended" ]||die '没有不同于当前入口的合格备用 IP'
+ recommended=$(recommended_other "$current")
+ [ -n "$recommended" ]||{ log "当前 IP ${current} 已经是最优选择，无需切换。";return 0; }
  printf '建议切换：%s -> %s。确认应用？[y/N] ' "$current" "$recommended"
  IFS= read -r answer||answer=''
  case "$answer" in y|Y|yes|YES|是) ;;*)log '已取消，未修改配置。';return 0;;esac

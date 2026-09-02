@@ -125,6 +125,9 @@ value(){ awk -F '\t' -v key="$1" '$1==key{print $2;exit}' "$STATE_DIR/monitor-st
 "$PROJECT_DIR/clash-entry-ip.sh" diagnose >/dev/null
 "$PROJECT_DIR/clash-entry-ip.sh" apply 198.51.100.20 >/dev/null
 
+CLASH_TEST_CONNECTIVITY_MODE=all "$PROJECT_DIR/clash-entry-ip.sh" switch >"$TEST_ROOT/switch-optimal.txt"
+grep -q '当前 IP 198.51.100.20 已经是最优选择，无需切换' "$TEST_ROOT/switch-optimal.txt"
+
 CLASH_TEST_CONNECTIVITY_MODE=all "$PROJECT_DIR/clash-entry-ip.sh" health >/dev/null
 [ "$(value status)" = healthy ];[ "$(value internet_success)" = 3 ]
 grep -q '^<--noproxy>$' "$CLASH_TEST_CURL_LOG"
