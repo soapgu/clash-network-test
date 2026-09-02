@@ -161,6 +161,10 @@ CFA_ENTRY_TEST_ROUNDS=2 CFA_ENTRY_SAMPLE_PORTS=2 \
 
 安装、查看或卸载当前用户的 macOS 后台监测：
 
+> **实验性功能：** 以下 `monitor` 命令目前通过 macOS LaunchAgent 实现，
+> 主要用于验证持续健康检查、状态记录和通知流程。后续规划开发专门服务来承接
+> 后台监测与通知能力，不保证当前实验性实现的接口和状态文件格式长期兼容。
+
 ```bash
 ./clash-entry-ip.sh monitor install
 ./clash-entry-ip.sh monitor status
