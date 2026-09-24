@@ -113,6 +113,12 @@ CFA_ENTRY_TEST_ROUNDS=2 CFA_ENTRY_SAMPLE_PORTS=2 \
 ./clash-entry-ip.sh apply 198.51.100.20
 ```
 
+Mihomo TCP 控制接口默认使用 `set-your-secret` 作为 Bearer 密钥，无需额外配置。
+如果已在 Clash Verge Rev 中更换密钥，可通过
+`CLASH_ENTRY_CONTROLLER_SECRET=新密钥 ./clash-entry-ip.sh status` 指定。
+控制接口返回 401/403 时，`status` 会显示认证失败；`apply` 会在修改配置前
+报错退出。建议先用 `status` 确认控制接口可用，再执行 `apply`。
+
 应用操作会：
 
 1. 备份当前订阅的脚本覆写及当前运行配置；

@@ -15,7 +15,7 @@ mkdir -p "$APP_DIR/profiles" "$BIN_DIR"
 
 cat > "$APP_DIR/clash-verge.yaml" <<'EOF'
 mixed-port: 7897
-external-controller: ''
+external-controller: 127.0.0.1:9097
 external-controller-unix: /tmp/fake-mihomo.sock
 dns:
   nameserver:
@@ -103,6 +103,21 @@ EOF
 
 cat > "$BIN_DIR/curl" <<'EOF'
 #!/usr/bin/env bash
+if [[ " $* " == *'--unix-socket'* ]]; then
+  [ "${CLASH_TEST_UNIX_DOWN:-0}" = 1 ] && exit 7
+  [ "${CLASH_TEST_CONTROLLER_DOWN:-0}" = 1 ] && exit 7
+  if [[ " $* " == *'/version'* ]]; then
+    printf '{"version":"test"}'
+    exit 0
+  fi
+fi
+if [[ " $* " == *'/version'* && " $* " == *"-w %{http_code}"* ]]; then
+  [ "${CLASH_TEST_CONTROLLER_DOWN:-0}" = 1 ] && exit 7
+  expected=${CLASH_TEST_EXPECT_SECRET:-set-your-secret}
+  [[ " $* " == *"Authorization: Bearer $expected"* ]] || { printf '401'; exit 0; }
+  printf '%s' "${CLASH_TEST_HTTP_STATUS:-200}"
+  exit 0
+fi
 case " $* " in
   *--write-out*) [ "${CLASH_TEST_FAIL_SMOKE:-0}" = 1 ] && exit 1; printf '204' ;;
   */version*) [ "${CLASH_TEST_CONTROLLER_DOWN:-0}" = 1 ] && exit 1; printf '{"version":"test"}' ;;
@@ -133,6 +148,33 @@ export CLASH_ENTRY_MAX_CONCURRENCY=2
 "$PROJECT_DIR/clash-entry-ip.sh" status > "$TEST_ROOT/status.txt"
 grep -q 'Mihomo控制接口：可用' "$TEST_ROOT/status.txt"
 grep -q '最近报告：testable' "$TEST_ROOT/status.txt"
+
+# Unix 接口不可用时，TCP 默认密钥和显式覆盖均应携带 Bearer 认证。
+export CLASH_TEST_UNIX_DOWN=1
+"$PROJECT_DIR/clash-entry-ip.sh" status > "$TEST_ROOT/status.txt"
+grep -q 'Mihomo控制接口：可用（tcp）' "$TEST_ROOT/status.txt"
+CLASH_ENTRY_CONTROLLER_SECRET=custom-secret CLASH_TEST_EXPECT_SECRET=custom-secret \
+  "$PROJECT_DIR/clash-entry-ip.sh" status > "$TEST_ROOT/status.txt"
+grep -q 'Mihomo控制接口：可用（tcp）' "$TEST_ROOT/status.txt"
+
+before_runtime=$(shasum -a 256 "$APP_DIR/clash-verge.yaml")
+before_script=$(shasum -a 256 "$APP_DIR/profiles/main.js")
+for code in 401 403; do
+  CLASH_TEST_HTTP_STATUS=$code "$PROJECT_DIR/clash-entry-ip.sh" status > "$TEST_ROOT/status.txt"
+  grep -q 'Mihomo控制接口：认证失败' "$TEST_ROOT/status.txt"
+  if CLASH_TEST_HTTP_STATUS=$code "$PROJECT_DIR/clash-entry-ip.sh" apply 198.51.100.20 > "$TEST_ROOT/apply.out" 2>&1; then
+    printf '认证失败不应允许应用\n' >&2
+    exit 1
+  fi
+  grep -q 'Mihomo控制接口认证失败' "$TEST_ROOT/apply.out"
+  [ "$(shasum -a 256 "$APP_DIR/clash-verge.yaml")" = "$before_runtime" ]
+  [ "$(shasum -a 256 "$APP_DIR/profiles/main.js")" = "$before_script" ]
+done
+CLASH_TEST_HTTP_STATUS=503 "$PROJECT_DIR/clash-entry-ip.sh" status > "$TEST_ROOT/status.txt"
+grep -q 'Mihomo控制接口：不可用' "$TEST_ROOT/status.txt"
+unset CLASH_TEST_UNIX_DOWN
+"$PROJECT_DIR/clash-entry-ip.sh" status > "$TEST_ROOT/status.txt"
+grep -q 'Mihomo控制接口：可用（unix）' "$TEST_ROOT/status.txt"
 
 awk -F '\t' '$1=="198.51.100.20" && $2=="yes" {ok=1} END{exit !ok}' "$STATE_DIR/latest-report.tsv"
 awk -F '\t' '$1=="192.0.2.10" && $2=="no" {ok=1} END{exit !ok}' "$STATE_DIR/latest-report.tsv"

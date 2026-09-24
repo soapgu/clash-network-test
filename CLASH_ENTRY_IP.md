@@ -386,8 +386,10 @@ flowchart TD
 ```
 
 控制接口优先使用 `external-controller-unix` 指定的 Unix Socket；不可用时再尝试
-`external-controller` 指定的 TCP 地址。TCP 接口如果配置了有效 `secret`，请求会
-携带 Bearer Token。相关值优先从当前运行配置读取，再以基础配置作为后备。
+`external-controller` 指定的 TCP 地址。TCP 请求默认携带 `set-your-secret` 作为
+Bearer 密钥；可用 `CLASH_ENTRY_CONTROLLER_SECRET` 环境变量覆盖。控制地址优先
+从当前运行配置读取，再以基础配置作为后备。401/403 会明确报告认证失败，
+`apply`、`reset` 和 `rollback` 会在修改配置前退出。
 
 ## 7. `reset` 与 `rollback` 的区别
 

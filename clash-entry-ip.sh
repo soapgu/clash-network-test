@@ -209,13 +209,27 @@ reset_transform(){ awk -v old="$3" -v domain="$4" '/^proxies:[[:space:]]*$/{p=1;
 
 tcp_req(){
  local data=${3:-}
- if [ -n "${CONTROLLER_SECRET:-}" ]&&[ "$CONTROLLER_SECRET" != set-your-secret ];then
+ if [ -n "${CONTROLLER_SECRET:-}" ];then
   if [ -n "$data" ];then curl -sSf --connect-timeout 3 -H "Authorization: Bearer $CONTROLLER_SECRET" -H 'Content-Type: application/json' -X "$1" --data-binary "@$data" "$CONTROLLER_URL$2";else curl -sSf --connect-timeout 3 -H "Authorization: Bearer $CONTROLLER_SECRET" -X "$1" "$CONTROLLER_URL$2";fi
  else
   if [ -n "$data" ];then curl -sSf --connect-timeout 3 -H 'Content-Type: application/json' -X "$1" --data-binary "@$data" "$CONTROLLER_URL$2";else curl -sSf --connect-timeout 3 -X "$1" "$CONTROLLER_URL$2";fi
  fi
 }
-controller_init(){ CONTROLLER_KIND='';CONTROLLER_SOCKET=$(scalar external-controller-unix "$RUNTIME_CONFIG");[ -n "$CONTROLLER_SOCKET" ]||CONTROLLER_SOCKET=$(scalar external-controller-unix "$BASE_CONFIG");if [ -n "$CONTROLLER_SOCKET" ]&&curl -sf --connect-timeout 2 --unix-socket "$CONTROLLER_SOCKET" http://localhost/version>/dev/null;then CONTROLLER_KIND=unix;return;fi;CONTROLLER_URL=$(scalar external-controller "$RUNTIME_CONFIG");[ -n "$CONTROLLER_URL" ]||CONTROLLER_URL=$(scalar external-controller "$BASE_CONFIG");case "$CONTROLLER_URL" in http*) ;; '')return 1;; *)CONTROLLER_URL="http://$CONTROLLER_URL";;esac;CONTROLLER_SECRET=$(scalar secret "$RUNTIME_CONFIG");[ -n "$CONTROLLER_SECRET" ]||CONTROLLER_SECRET=$(scalar secret "$BASE_CONFIG");tcp_req GET /version>/dev/null 2>&1&&{ CONTROLLER_KIND=tcp;return;};return 1; }
+controller_init(){
+ CONTROLLER_KIND='';CONTROLLER_AUTH_FAILED=no
+ CONTROLLER_SOCKET=$(scalar external-controller-unix "$RUNTIME_CONFIG")
+ [ -n "$CONTROLLER_SOCKET" ]||CONTROLLER_SOCKET=$(scalar external-controller-unix "$BASE_CONFIG")
+ if [ -n "$CONTROLLER_SOCKET" ]&&curl -sf --connect-timeout 2 --unix-socket "$CONTROLLER_SOCKET" http://localhost/version>/dev/null;then CONTROLLER_KIND=unix;return 0;fi
+ CONTROLLER_URL=$(scalar external-controller "$RUNTIME_CONFIG")
+ [ -n "$CONTROLLER_URL" ]||CONTROLLER_URL=$(scalar external-controller "$BASE_CONFIG")
+ case "$CONTROLLER_URL" in http*) ;; '')return 1;; *)CONTROLLER_URL="http://$CONTROLLER_URL";;esac
+ CONTROLLER_SECRET="${CLASH_ENTRY_CONTROLLER_SECRET:-set-your-secret}"
+ local code
+ code=$(curl -sS --connect-timeout 3 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $CONTROLLER_SECRET" "$CONTROLLER_URL/version" 2>/dev/null)||return 1
+ case "$code" in 2??)CONTROLLER_KIND=tcp;return 0;;401|403)CONTROLLER_AUTH_FAILED=yes;;esac
+ return 1
+}
+controller_error(){ [ "$CONTROLLER_AUTH_FAILED" = yes ]&&die 'Mihomo控制接口认证失败；请检查控制接口密钥，未修改配置';die 'Mihomo控制接口不可连接；未修改配置'; }
 request(){ if [ "$CONTROLLER_KIND" = unix ];then if [ -n "${3:-}" ];then curl -sSf --connect-timeout 3 --unix-socket "$CONTROLLER_SOCKET" -H 'Content-Type: application/json' -X "$1" --data-binary "@$3" "http://localhost$2";else curl -sSf --connect-timeout 3 --unix-socket "$CONTROLLER_SOCKET" -X "$1" "http://localhost$2";fi;else tcp_req "$@";fi; }
 reload(){ ruby --disable-gems -rjson -e 'print JSON.generate({"payload"=>File.read(ARGV[0])})' "$1">"$2";request PUT '/configs?force=true' "$2">/dev/null&&request GET /configs>/dev/null; }
 smoke(){ local port code;port=$(scalar mixed-port "$RUNTIME_CONFIG");[ -n "$port" ]||port=7897;code=$(curl --silent --output /dev/null --write-out '%{http_code}' --connect-timeout 8 --max-time 15 --proxy "http://127.0.0.1:$port" https://www.google.com/generate_204||true);case "$code" in 2*|3*)return;;*)return 1;;esac; }
@@ -224,7 +238,7 @@ new_backup(){ local stamp backup suffix=0;stamp=$(date '+%Y%m%d-%H%M%S');backup=
 
 apply_ip(){
  local ip=${1:-} meta uid name raw script sp domain old oldd backup manifest work changed payload fail=0
- [ -n "$ip" ]||die "用法：$0 apply <IPv4>";is_ipv4 "$ip"||die "非法 IPv4：$ip";validate "$ip";need curl;check_files;controller_init||die 'Mihomo控制接口不可连接；未修改配置'
+ [ -n "$ip" ]||die "用法：$0 apply <IPv4>";is_ipv4 "$ip"||die "非法 IPv4：$ip";validate "$ip";need curl;check_files;controller_init||controller_error
  meta=$(current_profile);IFS="$TAB" read -r uid name raw script<<<"$meta";sp="$APP_DIR/profiles/$script";[ -f "$sp" ]||die '脚本覆写不存在';safe_script "$sp"||die '当前订阅脚本已有自定义逻辑，拒绝覆盖';domain=$(rv '# domain');old=$(managed pinnedIp "$sp");oldd=$(managed domain "$sp");[ "$old" = "$ip" ]&&[ "$oldd" = "$domain" ]&&{ log "已经锁定 $domain -> ${ip}，无需重复写入";return; }
  backup=$(new_backup);cp "$sp" "$backup/script.js";cp "$RUNTIME_CONFIG" "$backup/clash-verge.yaml";manifest="$backup/manifest.tsv";printf 'script\t%s\tscript.js\nruntime\t%s\tclash-verge.yaml\n' "$sp" "$RUNTIME_CONFIG">"$manifest"
  work=$(mktemp -d "${TMPDIR:-/tmp}/entry-apply.XXXXXX");changed="$work/config";payload="$work/payload";transform "$RUNTIME_CONFIG" "$changed" "$domain" "$ip" "$old";write_script "$sp" "$domain" "$ip"||fail=1;[ "$fail" -ne 0 ]||restore "$changed" "$RUNTIME_CONFIG"||fail=1;[ "$fail" -ne 0 ]||reload "$RUNTIME_CONFIG" "$payload"||fail=1;[ "$fail" -ne 0 ]||smoke||fail=1
@@ -235,7 +249,7 @@ reset_lock(){
  local meta uid name raw script sp domain ip backup manifest work changed payload fail=0
  need curl;check_files;meta=$(current_profile)||die '无法定位当前订阅';IFS="$TAB" read -r uid name raw script<<<"$meta";sp="$APP_DIR/profiles/$script";[ -f "$sp" ]||die '脚本覆写不存在'
  if ! grep -qF "$MANAGED_BEGIN" "$sp";then log '当前订阅没有由 clash-entry-ip.sh 创建的入口锁定，无需恢复。';return;fi
- domain=$(managed domain "$sp");ip=$(managed pinnedIp "$sp");[ -n "$domain" ]&&[ -n "$ip" ]&&is_ipv4 "$ip"||die '受管脚本内容不完整，未修改配置';controller_init||die 'Mihomo控制接口不可连接；未修改配置'
+ domain=$(managed domain "$sp");ip=$(managed pinnedIp "$sp");[ -n "$domain" ]&&[ -n "$ip" ]&&is_ipv4 "$ip"||die '受管脚本内容不完整，未修改配置';controller_init||controller_error
  backup=$(new_backup);cp "$sp" "$backup/script.js";cp "$RUNTIME_CONFIG" "$backup/clash-verge.yaml";manifest="$backup/manifest.tsv";printf 'script\t%s\tscript.js\nruntime\t%s\tclash-verge.yaml\n' "$sp" "$RUNTIME_CONFIG">"$manifest"
  work=$(mktemp -d "${TMPDIR:-/tmp}/entry-reset.XXXXXX");changed="$work/config";payload="$work/payload";reset_transform "$RUNTIME_CONFIG" "$changed" "$ip" "$domain"||fail=1;[ "$fail" -ne 0 ]||write_passthrough "$sp"||fail=1;[ "$fail" -ne 0 ]||restore "$changed" "$RUNTIME_CONFIG"||fail=1;[ "$fail" -ne 0 ]||reload "$RUNTIME_CONFIG" "$payload"||fail=1;[ "$fail" -ne 0 ]||smoke||fail=1
  if [ "$fail" -ne 0 ];then restore "$backup/script.js" "$sp"||true;restore "$backup/clash-verge.yaml" "$RUNTIME_CONFIG"||true;reload "$RUNTIME_CONFIG" "$payload">/dev/null 2>&1||true;rm -rf "$work";die '恢复失败，文件已还原';fi
@@ -334,11 +348,11 @@ status(){
  sp="$APP_DIR/profiles/$script";ip=$(managed pinnedIp "$sp");d=$(managed domain "$sp")
  log "当前订阅：${name:-$uid}（${uid}）";log "原始配置：$raw"
  if [ -n "$ip" ];then log "入口锁定：$d -> $ip";else log '入口锁定：未锁定';fi
- if controller_init;then log "Mihomo控制接口：可用（${CONTROLLER_KIND}）";else log 'Mihomo控制接口：不可用';fi
+ if controller_init;then log "Mihomo控制接口：可用（${CONTROLLER_KIND}）";elif [ "$CONTROLLER_AUTH_FAILED" = yes ];then log 'Mihomo控制接口：认证失败';else log 'Mihomo控制接口：不可用';fi
  if [ -f "$LATEST_REPORT" ];then log "最近报告：$(rv '# status')，订阅=$(rv '# profile_name')，域名=$(rv '# domain')，原因=$(rv '# skip_reason')";else log '最近报告：无';fi
  if [ -f "$MONITOR_STATE" ];then log "后台健康：$(state_value status)，连续失败=$(state_value consecutive_failures)，推荐=$(state_value recommended_ip)";else log '后台健康：无';fi
  return 0
 }
-rollback(){ need curl;[ -f "$CURRENT_BACKUP" ]||die '没有可回滚的成功应用';local b m k d f w;b=$(cat "$CURRENT_BACKUP");m="$b/manifest.tsv";[ -f "$m" ]||die '备份清单不存在';controller_init||die 'Mihomo控制接口不可连接；未修改配置';while IFS="$TAB" read -r k d f;do case "$k" in script|runtime)restore "$b/$f" "$d"||die "恢复失败：$d";;esac;done<"$m";w=$(mktemp -d "${TMPDIR:-/tmp}/entry-rollback.XXXXXX");reload "$RUNTIME_CONFIG" "$w/payload"||die '文件已恢复，但 Mihomo重载失败';rm -rf "$w";mv "$CURRENT_BACKUP" "$b/rolled-back-at-$(date '+%Y%m%d-%H%M%S')";log "已恢复：$b"; }
+rollback(){ need curl;[ -f "$CURRENT_BACKUP" ]||die '没有可回滚的成功应用';local b m k d f w;b=$(cat "$CURRENT_BACKUP");m="$b/manifest.tsv";[ -f "$m" ]||die '备份清单不存在';controller_init||controller_error;while IFS="$TAB" read -r k d f;do case "$k" in script|runtime)restore "$b/$f" "$d"||die "恢复失败：$d";;esac;done<"$m";w=$(mktemp -d "${TMPDIR:-/tmp}/entry-rollback.XXXXXX");reload "$RUNTIME_CONFIG" "$w/payload"||die '文件已恢复，但 Mihomo重载失败';rm -rf "$w";mv "$CURRENT_BACKUP" "$b/rolled-back-at-$(date '+%Y%m%d-%H%M%S')";log "已恢复：$b"; }
 usage(){ printf '用法：\n  %s diagnose\n  %s apply <IPv4>\n  %s health\n  %s switch\n  %s monitor <install|status|uninstall>\n  %s reset\n  %s status\n  %s rollback\n' "$0" "$0" "$0" "$0" "$0" "$0" "$0" "$0"; }
 case "${1:-}" in diagnose)diagnose;;apply)apply_ip "${2:-}";;health)health_check no;;switch)switch_ip;;monitor)monitor_cmd "${2:-}";;reset)reset_lock;;status)status;;rollback)rollback;;__probe)CONNECT_TIMEOUT="${CLASH_ENTRY_CONNECT_TIMEOUT:-3}";probe "${2:-}" "${3:-}">>"${CLASH_ENTRY_RESULTS_FILE:?}";;help|-h|--help|'')usage;;*)usage>&2;exit 1;;esac
